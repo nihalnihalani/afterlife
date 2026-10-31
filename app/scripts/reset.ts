@@ -13,10 +13,10 @@ const config: RunConfig = {
     channel: `${runId}-fleet`,
     tasks: FACT_SHEETS.map(s => ({ id: s.id, title: s.title })),
     workers: ["w1", "w2", "w3"],
-    standbys: ["s1", "s2"],
+    standbys: ["s1", "s2", "s3"],
 }
 writeFileSync(`${RUN_DIR}/run.json`, JSON.stringify(config, null, 2))
 for (const t of config.tasks) {
-    await actors.Task.get(actorId(runId, t.id)).init({ taskId: t.id, title: t.title, totalSteps: env.totalSteps, leaseMs: env.leaseMs, maxAttempts: env.maxAttempts })
+    await actors.Task.get(actorId(runId, t.id)).init({ taskId: t.id, title: t.title, totalSteps: env.totalSteps, leaseMs: env.leaseMs, progressMs: env.progressMs, maxAttempts: env.maxAttempts })
 }
 console.log(`run ${runId} ready: ${config.tasks.map(t => t.id).join(", ")}`)

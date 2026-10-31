@@ -57,22 +57,44 @@
   #feed { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column-reverse; gap: 3px; max-height: 220px; overflow: auto; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
   .chip { display: inline-block; min-width: 70px; font-weight: 700; }
   .chip.CKPT { color: var(--run); } .chip.LOST { color: var(--lost); } .chip.HANDOFF { color: var(--hand); } .chip.DONE { color: var(--done); } .chip.STEER { color: #d58cff; }
+  .chip.TOOK { color: var(--hand); } .chip.TOMBSTONE { color: var(--muted); } .chip.ACK { color: #8ff0e0; } .chip.REVIEW { color: #f0d98f; } .chip.REACT { color: #c9c2d6; }
   .empty { padding: 40px 18px; color: var(--muted); }
+  /* A lost task is a ghost until someone takes it over. */
+  .card.lost .content { filter: grayscale(.55) opacity(.75); }
+  .status.lost::before { content: "👻 "; }
+  .card .why { font-size: 12px; color: var(--lost); font-weight: 600; }
+  .takeover b { color: var(--text); }
+  #controls { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; padding: 10px 18px; border-bottom: 1px solid var(--line); background: #110e17; }
+  #controls .group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  #controls .label { font-size: 11px; color: var(--muted); letter-spacing: .06em; }
+  .agent { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 8px; padding: 2px 4px 2px 8px; font-size: 12px; }
+  .agent .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--run); }
+  .agent.dead { opacity: .5; text-decoration: line-through; } .agent.dead .dot { background: var(--lost); }
+  .agent.frozen .dot { background: #8fc7ff; } .agent.hung .dot { background: var(--hand); }
+  .agent button, #controls > .group > button { background: #241f2e; color: var(--text); border: 1px solid var(--line); border-radius: 6px; font-size: 11px; padding: 2px 6px; cursor: pointer; }
+  .agent button:hover, #controls button:hover { border-color: var(--hand); }
+  #controls button.story { background: var(--hand); color: #120f18; font-weight: 700; padding: 4px 12px; font-size: 12px; }
+  #caption { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); max-width: min(900px, 92vw); background: #000c; border: 1px solid var(--hand); color: #fff; font-size: 20px; line-height: 1.35; padding: 12px 18px; border-radius: 10px; text-align: center; display: none; z-index: 10; box-shadow: 0 8px 40px #000; }
+  footer { padding: 0 18px 18px; display: flex; flex-wrap: wrap; gap: 8px; }
 </style>
 </head>
 <body>
 <header>
   <h1>AFTERLIFE <small>when an agent dies, its work doesn't</small></h1>
-  <span class="badge" id="run">run …</span>
-  <span class="badge" id="transport">transport …</span>
   <span class="badge" id="llm">LLM …</span>
-  <span class="badge warn">DATA: SYNTHETIC</span>
-  <span class="badge" id="pace"></span>
+  <span class="badge" id="a2a">agent-to-agent messages: 0</span>
   <span class="badge" id="ws">actors ws</span>
   <span class="badge" id="sse">bridge feed</span>
 </header>
+<section id="controls">
+  <div class="group" id="roster"><span class="label">AGENTS</span><span class="meta">control offline (scripts/demo.sh up starts it)</span></div>
+  <div class="group"><span class="label">SUPERVISOR</span><button data-chaos="kill" data-agent="bridge">kill bridge</button><button data-chaos="bridge-start">start bridge</button></div>
+  <div class="group"><button data-chaos="new-run">new run</button><button class="story" id="story">▶ Story</button></div>
+</section>
 <main id="cards"><div class="empty">Loading run…</div></main>
-<section class="feed"><h2>AGENT RELAY · #fleet + DMs</h2><ul id="feed"></ul></section>
+<section class="feed"><h2>AGENT RELAY · #fleet, threads, DMs and reactions</h2><ul id="feed"></ul></section>
+<footer><span class="badge" id="run">run …</span><span class="badge" id="transport">transport …</span><span class="badge" id="pace"></span><span class="badge warn">DATA: SYNTHETIC</span></footer>
+<div id="caption"></div>
 <script>
   const SECTIONS = ["Arrival", "Ground floor", "Upper floors", "The anomaly", "Witness accounts", "Conclusion"]
   const state = {}
@@ -96,6 +118,72 @@
     render()
     connectActors()
     connectFeed()
+    pollAgents()
+  }
+
+  // ---- Demo controls (scripts/control.ts): fault injection with buttons, and a narrated story.
+  const controlUrl = path => "http://127.0.0.1:" + (run.controlPort || 3001) + path
+  async function chaos(action, agent) {
+    try { await fetch(controlUrl("/chaos"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, agent }) }) } catch {}
+    if (action === "new-run") setTimeout(() => location.reload(), 4500)
+    setTimeout(pollAgentsOnce, 300)
+  }
+  document.addEventListener("click", ev => {
+    const b = ev.target.closest("button[data-chaos]")
+    if (b) chaos(b.dataset.chaos, b.dataset.agent)
+  })
+  const ACTIONS = { worker: [["kill", "kill -9"], ["freeze", "freeze"], ["resume", "resume"], ["hang", "hang"]] }
+  async function pollAgentsOnce() {
+    let data
+    try { data = await (await fetch(controlUrl("/agents"))).json() } catch { return }
+    const roster = $("roster")
+    roster.replaceChildren(el("span", "label", "AGENTS"))
+    for (const a of data.agents) {
+      if (a.name === "bridge" || a.name === "reviewer") continue
+      const chip = el("span", "agent " + a.state)
+      chip.append(el("span", "dot"), el("span", "", a.name + (a.state === "alive" ? "" : " · " + a.state)))
+      if (a.state !== "dead") for (const [action, label] of ACTIONS.worker) {
+        if (action === "resume" && a.state !== "frozen") continue
+        if (action === "freeze" && a.state === "frozen") continue
+        const btn = el("button", "", label); btn.dataset.chaos = action; btn.dataset.agent = a.name; chip.append(btn)
+      }
+      roster.append(chip)
+    }
+    const reviewer = data.agents.find(a => a.name === "reviewer")
+    if (reviewer) { const r = el("span", "agent " + reviewer.state); r.append(el("span", "dot"), el("span", "", "reviewer")); roster.append(r) }
+  }
+  function pollAgents() { pollAgentsOnce(); setInterval(pollAgentsOnce, 1000) }
+
+  const caption = text => { const c = $("caption"); c.textContent = text; c.style.display = text ? "block" : "none" }
+  const pause = ms => new Promise(r => setTimeout(r, ms))
+  async function steerApi(taskId, text) {
+    try { await fetch("/api/steer", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ taskId, text }) }) } catch {}
+  }
+  // About 70 seconds. Each beat is a real fault injected into real processes; nothing is scripted
+  // on the agent side. Run it a few seconds after a new run, while all three agents are writing.
+  const STORY = [
+    [0, "Three AI agents are each writing a field report. Every word streams into a Durable Actor that owns the task.", null],
+    [4000, "A human steers w2 over Agent Relay: “write it like a ghost”. The actor records the instruction before it is delivered.", () => steerApi("t2", "write it like a ghost")],
+    [4500, "Now kill -9 w2, and the supervisor too. No process is left to notice.", async () => { await chaos("kill", "w2"); await chaos("kill", "bridge") }],
+    [2500, "Freeze w3 (kill -STOP). It will wake up later as a zombie.", () => chaos("freeze", "w3")],
+    [2500, "Hang w1. It keeps heartbeating, so its lease looks healthy, but it stopped making progress.", () => chaos("hang", "w1")],
+    [6500, "w2's lease ran out inside the actor. With no supervisor alive, the actor offered t2 to the standbys itself: one finished w2's half-written sentence, mid-word, and kept the human's instruction.", null],
+    [9000, "w3 went silent too. And w1? Its heartbeat kept the lease full, but the actor's progress deadline flagged it STUCK, not dead. Every task has a new owner.", null],
+    [7000, "Over Agent Relay the new owners announced each takeover, a reviewer agent checked continuity, and each owner ACKed. No supervisor relayed any of it.", null],
+    [5000, "Wake the zombie w3. Its first write carries an old attempt number, and the actor rejects it.", () => chaos("resume", "w3")],
+    [5000, "Bring the supervisor back. It reads Relay's history: everything the agents said to each other while it was dead.", () => chaos("bridge-start")],
+    [8000, "", null],
+  ]
+  let storyRunning = false
+  $("story").onclick = async () => {
+    if (storyRunning) return
+    storyRunning = true
+    for (const [wait, text, act] of STORY) {
+      await pause(wait)
+      caption(text)
+      if (act) await act()
+    }
+    storyRunning = false
   }
 
   // One WebSocket per Task actor. Any close (or failed handshake) triggers exactly one
@@ -130,9 +218,14 @@
     } catch { retry() }
   }
 
+  // Messages one agent sends to another (or to the human) without any supervisor in between.
+  const A2A = new Set(["TOOK", "TOMBSTONE", "ACK", "REVIEW", "REACT", "STEER"])
+  let a2a = 0
   function connectFeed() {
     const es = new EventSource("/api/feed")
     es.onopen = () => {
+      // The bridge replays its recent feed on every connect: start counting again.
+      a2a = 0; setBadge("a2a", "agent-to-agent messages: 0"); $("feed").replaceChildren()
       const last = downWindows[downWindows.length - 1]
       if (last && last[1] == null) last[1] = Date.now()
       setBadge("sse", "bridge feed", "ok")
@@ -144,6 +237,9 @@
     }
     es.onmessage = ev => {
       const item = JSON.parse(ev.data)
+      if (A2A.has(item.type) && short(item.from) !== "human" && short(item.from) !== "bridge") {
+        a2a++; setBadge("a2a", "agent-to-agent messages: " + a2a, "ok")
+      }
       const li = el("li")
       li.append(el("span", "chip " + item.type, item.type), document.createTextNode(" " + new Date(item.at).toLocaleTimeString() + "  " + short(item.from) + " → " + short(item.to).replace("#" + run.channel, "#fleet") + "  " + item.text))
       $("feed").prepend(li)
@@ -172,10 +268,14 @@
   }
 
   let pending = false
+  // requestAnimationFrame pauses in a hidden tab, which would leave `pending` stuck; a timer
+  // fallback keeps the board current wherever it is shown.
   function scheduleRender() {
     if (pending) return
     pending = true
-    requestAnimationFrame(() => { pending = false; render() })
+    const run = () => { if (!pending) return; pending = false; render() }
+    requestAnimationFrame(run)
+    setTimeout(run, 120)
   }
 
   function render() {
@@ -192,8 +292,9 @@
       const content = card.firstChild
       content.replaceChildren()
       const top = el("div", "top")
-      top.append(el("span", "title", t.id + " · " + (s.title || t.title)), el("span", "status " + s.status, s.status))
+      top.append(el("span", "title", t.id + " · " + (s.title || t.title)), el("span", "status " + s.status, s.status === "lost" ? "lost · " + (s.lostReason || "silent") : s.status))
       content.append(top)
+      if (s.status === "lost") content.append(el("div", "why", s.lostReason === "stuck" ? short(s.lostWorker) + " was heartbeating but made no progress: the actor's progress deadline fired" : short(s.lostWorker) + " went silent: the lease alarm fired inside the actor"))
       const owner = s.status === "lost" ? "was " + short(s.lostWorker) + " · offered to standbys by the actor" : short(s.assignee) || "—"
       content.append(el("div", "meta", "owner " + owner + " · attempt " + (s.attempt || 0) + " · " + (s.ledger || []).length + "/" + (s.totalSteps || 6) + " steps"))
       const lease = el("div", "lease"), fill = el("div")
@@ -242,7 +343,21 @@
       }
       content.append(ul)
       ul.scrollTop = ul.scrollHeight
-      if (s.takeover && s.takeover.attempt === s.attempt) content.append(el("div", "takeover", "↪ " + short(s.takeover.to) + " took over from " + short(s.takeover.from) + " at step " + s.takeover.atStep + (s.takeover.afterMs != null ? " · recovered in " + (s.takeover.afterMs / 1000).toFixed(1) + "s" : "") + " · no supervisor involved"))
+      if (s.takeover && s.takeover.attempt === s.attempt) {
+        const tk = s.takeover
+        const before = (s.ledger || []).filter(c => c.stepId < tk.atStep)
+        const secs = before.reduce((sum, c) => sum + (c.ms || 0), 0) / 1000
+        const cutStep = (s.ledger || []).find(c => c.stepId === tk.atStep && c.continued)
+        const line = el("div", "takeover")
+        line.append(
+          document.createTextNode("↪ "), el("b", "", short(tk.to)),
+          document.createTextNode(" took over from " + short(tk.from) + (tk.why === "stuck" ? " (stuck)" : " (silent)") + " at step " + tk.atStep +
+            (tk.afterMs != null ? " · recovered in " + (tk.afterMs / 1000).toFixed(1) + "s, no supervisor" : "") +
+            " · inherited " + before.length + " step" + (before.length === 1 ? "" : "s") + (secs ? " (" + secs.toFixed(0) + "s of agent work)" : "") +
+            (cutStep ? " + a half-written sentence" : "") +
+            ((s.directives || []).some(d => short(d.from) === "human") ? " + the human's instruction" : "")))
+        content.append(line)
+      }
       if ((s.directives || []).length) content.append(el("div", "directives", "directives: " + s.directives.map(d => "“" + d.text + "”").join(", ")))
       for (const r of (s.rejections || []).slice(-3)) content.append(el("div", "rejections", rejectionText(r)))
       const tl = (s.timeline || []).slice(-3)

@@ -29,10 +29,13 @@ export const env = {
     leaseMs: num("LEASE_MS", 10000),
     heartbeatMs: num("HEARTBEAT_MS", 2000),
     pollMs: num("POLL_MS", 1000),
-    handoffTimeoutMs: num("HANDOFF_TIMEOUT_MS", 15000),
+    // No draft growth or checkpoint for this long means the agent is stuck, even if it heartbeats.
+    progressMs: num("PROGRESS_MS", 15000),
     maxAttempts: num("MAX_ATTEMPTS", 3),
     stepPaceMs: num("STEP_PACE_MS", 6000),
     bridgePort: num("BRIDGE_PORT", 3000),
+    controlPort: num("CONTROL_PORT", 3001),
+    reviewer: process.env.REVIEWER !== "0",
     totalSteps: 6,
 }
 
@@ -50,7 +53,7 @@ export const relayKey = (runId: string, taskId: string, attempt: number, kind: s
 
 export type RelayMeta = {
     v: 1
-    type: "CKPT" | "LOST" | "HANDOFF" | "DONE" | "STEER" | "TOOK" | "TOMBSTONE"
+    type: "CKPT" | "LOST" | "HANDOFF" | "DONE" | "STEER" | "TOOK" | "TOMBSTONE" | "ACK" | "REVIEW"
     runId: string
     taskId: string
     attempt: number

@@ -60,8 +60,9 @@ async function observe(s: State) {
     }
     if (s.status === "lost") {
         const lost = (s.lostWorker ?? "?").replace(`${run.runId}-`, "")
+        const why = s.lostReason === "stuck" ? "is stuck (heartbeating, no progress)" : "went silent"
         await once(`lost:${s.taskId}:${s.attempt}`, () =>
-            announce(`#${run.channel}`, `LOST ${s.taskId}: ${lost} went silent; the actor offered attempt ${s.attempt} to standbys`, { v: 1, type: "LOST", runId: run.runId, taskId: s.taskId, attempt: s.attempt, from: me, correlationId: cid }, relayKey(run.runId, s.taskId, s.attempt, "lost")),
+            announce(`#${run.channel}`, `LOST ${s.taskId}: ${lost} ${why}; the actor offered attempt ${s.attempt} to standbys`, { v: 1, type: "LOST", runId: run.runId, taskId: s.taskId, attempt: s.attempt, from: me, correlationId: cid }, relayKey(run.runId, s.taskId, s.attempt, "lost")),
         )
         if (claudeStandby && env.transport === "relay") {
             await once(`handoff:${s.taskId}:${s.attempt}`, () => announce(`@${claudeStandby}`, handoffPrompt(s), { v: 1, type: "HANDOFF", runId: run.runId, taskId: s.taskId, attempt: s.attempt, from: me, correlationId: cid }, relayKey(run.runId, s.taskId, s.attempt, "handoff")))
@@ -96,15 +97,50 @@ async function tick() {
     }
 }
 
+// The instruction is recorded in the Task actor first, then delivered over Relay. If the agent
+// dies before reading it, whoever takes over still gets it from the actor.
 async function steer(taskId: string, raw: string) {
     const text = raw.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 200)
-    const s = await taskOf(taskId).getState()
-    if (!humanClient || !text || s.status !== "running" || !s.assignee) return { ok: false, reason: "task-not-running" }
+    if (!humanClient || !text) return { ok: false, reason: "steer-unavailable" }
     const directiveId = `d${Date.now().toString(36)}`
-    const meta: RelayMeta = { v: 1, type: "STEER", runId: run.runId, taskId, attempt: s.attempt, directiveId, from: human, correlationId: correlationId(run.runId, taskId, s.attempt) }
-    await send(humanClient, `@${s.assignee}`, `STEER ${taskId}: ${text}`, meta, `${run.runId}-${taskId}-steer-${directiveId}`)
-    pushFeed({ at: Date.now(), type: "STEER", from: human, to: s.assignee, text: `STEER ${taskId} sent: ${text}` })
+    const r = await taskOf(taskId).steer({ id: directiveId, text, from: human })
+    if (!r.ok) return r
+    const meta: RelayMeta = { v: 1, type: "STEER", runId: run.runId, taskId, attempt: r.attempt, directiveId, from: human, correlationId: correlationId(run.runId, taskId, r.attempt) }
+    await send(humanClient, `@${r.assignee}`, `STEER ${taskId}: ${text}`, meta, `${run.runId}-${taskId}-steer-${directiveId}`)
+    pushFeed({ at: Date.now(), type: "STEER", from: human, to: r.assignee, text: `STEER ${taskId}: "${text}" (recorded in the actor, then sent)` })
     return { ok: true, directiveId }
+}
+
+const EMOJI: Record<string, string> = { eyes: "👀", white_check_mark: "✅" }
+const seen = new Set<string>()
+
+// A restarted bridge has an empty feed, but the agents kept talking while it was down. Relay
+// keeps the channel history, so read #fleet and its threads back into the feed.
+async function backfill(c: RelayAgentClient) {
+    try {
+        const messages = await c.messages.list(run.channel, { limit: 60 })
+        const items: FeedItem[] = []
+        for (const m of messages) {
+            const at = m.createdAt ? Date.parse(String(m.createdAt)) : Date.now()
+            const from = m.from?.name ?? "?"
+            if (!seen.has(m.id) && from !== me && from.startsWith(`${run.runId}-`)) {
+                seen.add(m.id)
+                items.push({ at, type: String(m.text).split(" ")[0] ?? "MSG", from, to: `#${run.channel}`, text: m.text })
+            }
+            if (!m.replyCount) continue
+            const thread = await c.threads.get(m.id).catch(() => null)
+            for (const reply of thread?.replies ?? []) {
+                if (seen.has(reply.id)) continue
+                seen.add(reply.id)
+                items.push({ at: reply.createdAt ? Date.parse(String(reply.createdAt)) : at, type: String(reply.text).split(" ")[0] ?? "MSG", from: reply.from?.name ?? "?", to: `#${run.channel} thread`, text: reply.text })
+            }
+        }
+        items.sort((a, b) => a.at - b.at)
+        for (const item of items) pushFeed(item)
+        if (items.length) pushFeed({ at: Date.now(), type: "BACKFILL", from: me, to: "-", text: `read ${items.length} messages back from Relay, including what the agents said to each other while the bridge was down` })
+    } catch (e: any) {
+        log(`backfill failed: ${e?.message}`)
+    }
 }
 
 async function main() {
@@ -115,9 +151,29 @@ async function main() {
         await joinChannel(client, run.channel)
         r.addListener("message.created", (event: any) => {
             const m = event.message
-            if (m?.channel?.name !== run.channel || m?.from?.name === me) return
+            if (m?.channel?.name !== run.channel || m?.from?.name === me || seen.has(m.id)) return
+            seen.add(m.id)
             pushFeed({ at: Date.now(), type: String(m.text).split(" ")[0] ?? "MSG", from: m.from?.name ?? "?", to: `#${run.channel}`, text: m.text })
         })
+        // Agent-to-agent traffic the board should show: thread replies on #fleet (reviews, ACKs),
+        // DMs and replies addressed to the human, and reactions.
+        const mirror = (to: string) => (event: any) => {
+            const m = event.message
+            if (!m?.id || seen.has(m.id) || m?.from?.name === me || m?.from?.name === human) return
+            if (to !== "human" && m?.channel?.name && m.channel.name !== run.channel) return
+            if (!String(m.from?.name ?? "").startsWith(`${run.runId}-`)) return
+            seen.add(m.id)
+            pushFeed({ at: Date.now(), type: String(m.text).split(" ")[0] ?? "MSG", from: m.from?.name ?? "?", to: to === "human" ? human : `#${run.channel} thread`, text: m.text })
+        }
+        r.addListener("thread.reply", mirror("thread"))
+        r.addListener("dm.received", mirror("human"))
+        r.addListener("message.reacted", (event: any) => {
+            const who = String(event.agentName ?? "?")
+            const emoji = String(event.emoji ?? "?")
+            if (event.action === "removed" || !who.startsWith(`${run.runId}-`) || who === me) return
+            pushFeed({ at: Date.now(), type: "REACT", from: who, to: "-", text: `${EMOJI[emoji] ?? emoji} ${emoji}` })
+        })
+        await backfill(client)
     }
     for (const t of run.tasks) {
         const r = await taskOf(t.id).rearm()
@@ -145,7 +201,7 @@ Bun.serve({
         if (host !== `127.0.0.1:${env.bridgePort}` && host !== `localhost:${env.bridgePort}`) return new Response("forbidden", { status: 403 })
         if (url.pathname === "/") return new Response(Bun.file(boardFile), { headers: { "Content-Type": "text/html; charset=utf-8" } })
         if (url.pathname === "/api/run") {
-            return Response.json({ runId: run.runId, channel: run.channel, tasks: run.tasks, transport: env.transport, llmMode: env.llmMode, model: env.openaiModel, stepPaceMs: env.stepPaceMs, bridgeBootedAt: bootedAt, steer: process.env.STEER_ENABLED === "1", claudeStandby: claudeStandby || null })
+            return Response.json({ runId: run.runId, channel: run.channel, tasks: run.tasks, transport: env.transport, llmMode: env.llmMode, model: env.openaiModel, stepPaceMs: env.stepPaceMs, bridgeBootedAt: bootedAt, steer: process.env.STEER_ENABLED !== "0", claudeStandby: claudeStandby || null, controlPort: env.controlPort })
         }
         if (url.pathname === "/api/grants") {
             const grants = await Promise.all(run.tasks.map(async t => ({ taskId: t.id, ...(await actors.Task.prepareWebsocket({ actorId: actorId(run.runId, t.id), metadata: { viewer: "board", role: "board" } })) })))
@@ -171,7 +227,7 @@ Bun.serve({
             return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-store" } })
         }
         if (url.pathname === "/api/steer" && req.method === "POST") {
-            if (process.env.STEER_ENABLED !== "1") return Response.json({ ok: false, reason: "steer-disabled" }, { status: 403 })
+            if (process.env.STEER_ENABLED === "0") return Response.json({ ok: false, reason: "steer-disabled" }, { status: 403 })
             if (!req.headers.get("content-type")?.includes("application/json")) return Response.json({ ok: false, reason: "json-only" }, { status: 415 })
             const body = (await req.json().catch(() => ({}))) as { taskId?: string; text?: string }
             if (!body.taskId || !run.tasks.some(t => t.id === body.taskId)) return Response.json({ ok: false, reason: "unknown-task" }, { status: 400 })

@@ -31,6 +31,14 @@ let busy: symbol | null = null
 const handled = new Set<string>()
 let client: RelayAgentClient | null = null
 
+// Demo fault: SIGUSR1 makes this agent hang. Its heartbeat keeps the lease alive, but it stops
+// making progress, so only the actor's progress deadline can tell that it is stuck.
+let hung = false
+process.on("SIGUSR1", () => {
+    hung = true
+    log("SIGUSR1: hanging (heartbeat continues, no more progress)")
+})
+
 const FENCED = new Set(["stale-attempt", "wrong-owner"])
 const DRAFT_EVERY_MS = 350
 
@@ -121,13 +129,17 @@ async function runTask(taskId: string, info: ClaimInfo) {
             const draft = draftStreamer(taskId, attempt, stepId)
             let out
             try {
-                out = await writeStep({ sheet, stepId, previous, directives: current.directives, worker: me, cutOff }, draft.push)
+                out = await writeStep({ sheet, stepId, previous, directives: current.directives, worker: me, cutOff }, text => {
+                    if (!hung) draft.push(text)
+                })
             } finally {
                 draft.stop()
             }
-            const wait = env.stepPaceMs - (Date.now() - started)
+            const ms = Date.now() - started
+            while (hung) await sleep(1000)
+            const wait = env.stepPaceMs - ms
             if (wait > 0) await sleep(wait)
-            const r = await callOrExit(() => task.checkpoint({ worker: me, attempt, step: { stepId, ...out } }))
+            const r = await callOrExit(() => task.checkpoint({ worker: me, attempt, step: { stepId, ...out, ms } }))
             if (!r.ok) {
                 if (FENCED.has(r.reason)) fenced(taskId, r.reason)
                 log(`checkpoint refused: ${r.reason}`)
@@ -137,7 +149,7 @@ async function runTask(taskId: string, info: ClaimInfo) {
             previous.push({ stepId, summary: stored.summary, worker: stored.worker })
             log(`step ${stepId}/${env.totalSteps}${r.duplicate ? " (already stored)" : ""}${cutOff ? " (finished the cut-off sentence)" : ""}`)
             if (env.transport === "relay" && client) {
-                const meta: RelayMeta = { v: 1, type: "CKPT", runId: run.runId, taskId, attempt, stepId, from: me, correlationId: correlationId(run.runId, taskId, attempt) }
+                const meta: RelayMeta & { callbacks: string[]; worker: string } = { v: 1, type: "CKPT", runId: run.runId, taskId, attempt, stepId, from: me, correlationId: correlationId(run.runId, taskId, attempt), callbacks: stored.callbacks, worker: stored.worker }
                 await send(client, `#${run.channel}`, `CKPT ${taskId} step ${stepId}/${env.totalSteps} by ${short} (attempt ${attempt}): ${stored.summary}`, meta, relayKey(run.runId, taskId, attempt, `ckpt:${stepId}`)).catch(e =>
                     log("CKPT send failed", e?.message),
                 )
@@ -165,7 +177,7 @@ async function claimAndRun(taskId: string, attempt: number, via: string) {
             log(`claim ${taskId} attempt ${attempt} (${via}) refused: ${r.reason}`)
             return
         }
-        if (attempt > 1 && !r.already) await announceTakeover(taskId, attempt, via)
+        if (attempt > 1 && !r.already) await announceTakeover(taskId, attempt, via, r.directives)
         await runTask(taskId, r)
     } finally {
         if (busy === token) busy = null
@@ -174,33 +186,51 @@ async function claimAndRun(taskId: string, attempt: number, via: string) {
 
 // Agent to agent over Relay: tell the fleet who took the task, and tell the agent it replaced.
 // The actor already enforces ownership; these messages explain it to the agents and humans.
-async function announceTakeover(taskId: string, attempt: number, via: string) {
+async function announceTakeover(taskId: string, attempt: number, via: string, directives: Directive[]) {
     const s = await call(() => actors.Task.get(actorId(run.runId, taskId)).getState()).catch(() => null)
     const t = s?.takeover
     const from = t?.from ?? null
     const fromShort = (from ?? "?").replace(`${run.runId}-`, "")
+    const why = (t?.why ?? s?.lostReason) === "stuck" ? "stuck" : "silent"
     const cut = s?.cutOff ? `, finishing its cut-off sentence "…${s.cutOff.text.slice(-40)}"` : ""
     const after = t?.afterMs != null ? ` ${(t.afterMs / 1000).toFixed(1)}s after it was lost` : ""
-    log(`took ${taskId} attempt ${attempt} from ${fromShort} via ${via}`)
+    const carry = directives.length ? `, keeping ${directives.length} human instruction${directives.length > 1 ? "s" : ""}` : ""
+    log(`took ${taskId} attempt ${attempt} from ${fromShort} (${why}) via ${via}`)
     if (env.transport !== "relay" || !client) return
     const cid = correlationId(run.runId, taskId, attempt)
-    await send(client, `#${run.channel}`, `TOOK ${taskId} attempt ${attempt} from ${fromShort} at step ${t?.atStep ?? "?"}${after}${cut}`, { v: 1, type: "TOOK", runId: run.runId, taskId, attempt, from: me, correlationId: cid }, relayKey(run.runId, taskId, attempt, "took")).catch(e => log("TOOK send failed", e?.message))
+    await send(client, `#${run.channel}`, `TOOK ${taskId} attempt ${attempt} from ${fromShort} (${why}) at step ${t?.atStep ?? "?"}${after}${cut}${carry}`, { v: 1, type: "TOOK", runId: run.runId, taskId, attempt, from: me, correlationId: cid }, relayKey(run.runId, taskId, attempt, "took")).catch(e => log("TOOK send failed", e?.message))
     if (from) {
         await send(client, `@${from}`, `TOMBSTONE ${taskId}: attempt ${attempt} belongs to ${short} now. Stop writing; the actor will reject attempt ${attempt - 1}.`, { v: 1, type: "TOMBSTONE", runId: run.runId, taskId, attempt, from: me, correlationId: cid }, relayKey(run.runId, taskId, attempt, "tombstone")).catch(e => log("TOMBSTONE send failed", e?.message))
     }
+    // The instruction outlives the agent it was given to: tell its author who carries it now.
+    for (const author of new Set(directives.map(d => d.from))) {
+        const mine = directives.filter(d => d.from === author).map(d => `"${d.text}"`).join(", ")
+        await send(client, `@${author}`, `ACK ${taskId}: ${fromShort} is gone; I (${short}) took over at step ${t?.atStep ?? "?"} and I am keeping your instruction ${mine}.`, { v: 1, type: "ACK", runId: run.runId, taskId, attempt, from: me, correlationId: cid }, relayKey(run.runId, taskId, attempt, `ack-carry:${author}`)).catch(e => log("ACK send failed", e?.message))
+    }
 }
 
-async function onSteer(meta: RelayMeta & Record<string, unknown>, text: string) {
+// A steer arrives as a Relay DM (from a human, or from the reviewer agent). Handshake: eyes on
+// receipt, record it in the actor (fenced by attempt), then an ACK reply and a check mark.
+async function onSteer(meta: RelayMeta & Record<string, unknown>, text: string, messageId: string) {
     const cur = current
     if (!cur || meta.taskId !== cur.taskId || !meta.directiveId) {
         log(`steer ${meta.directiveId ?? "?"} ignored: not working on ${meta.taskId}`)
         return
     }
+    client?.react({ messageId, emoji: "eyes" }).catch(() => {})
     const directive = { id: meta.directiveId, text: text.replace(/^STEER \S+: /, ""), from: meta.from, at: Date.now() }
     const task = actors.Task.get(actorId(run.runId, cur.taskId))
     const r = await call(() => task.addDirective({ worker: me, attempt: cur.attempt, directive }))
-    if (r.ok && !r.duplicate && current === cur) cur.directives = [...cur.directives, directive]
-    log(`steer ${directive.id}: ${r.ok ? "recorded" : r.reason}`)
+    if (r.ok && current === cur && !cur.directives.some(d => d.id === directive.id)) cur.directives = [...cur.directives, directive]
+    log(`steer ${directive.id} from ${String(meta.from).replace(`${run.runId}-`, "")}: ${r.ok ? "recorded" : r.reason}`)
+    if (!r.ok || !client) return
+    // A reviewer's note names the #fleet message to answer in, so the exchange stays public.
+    const target = typeof meta.replyTo === "string" ? meta.replyTo : messageId
+    const step = (await call(() => task.getState()).catch(() => null))?.ledgerLength ?? 0
+    await client
+        .reply({ messageId: target, text: `ACK ${cur.taskId} from ${short}: instruction recorded in the actor, applying it from step ${step + 1}.`, metadata: { v: 1, type: "ACK", runId: run.runId, taskId: cur.taskId, attempt: cur.attempt, from: me, correlationId: correlationId(run.runId, cur.taskId, cur.attempt) } })
+        .catch(e => log("ACK reply failed", e?.message))
+    client.react({ messageId, emoji: "white_check_mark" }).catch(() => {})
 }
 
 // One WebSocket per Task actor, tagged "standby". The actor pushes an `offer` when its lease
@@ -238,7 +268,7 @@ async function main() {
                 const message = event.message
                 const meta = await readMeta(client!, message.id)
                 if (!meta || meta.runId !== run.runId) return
-                if (meta.type === "STEER") onSteer(meta, message.text).catch(e => log("steer failed", e?.message))
+                if (meta.type === "STEER") onSteer(meta, message.text, message.id).catch(e => log("steer failed", e?.message))
                 else if (meta.type === "TOMBSTONE") log(`TOMBSTONE from ${String(meta.from).replace(`${run.runId}-`, "")}: ${message.text}`)
             })
         } catch (e: any) {
