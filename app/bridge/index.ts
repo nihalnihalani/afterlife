@@ -1,6 +1,7 @@
-// The bridge: stateless supervisor. It polls Task actors, hands lost tasks to an idle standby
-// over Relay, mirrors #fleet into a live feed for the board, and issues WebSocket grants.
-// Killing it is safe: leases keep expiring inside the actors without it.
+// The bridge: an observer, not a supervisor. Task actors offer lost tasks to standby agents
+// themselves, so killing the bridge never stops a handoff. It announces LOST and DONE on
+// #fleet, mirrors #fleet into a live feed for the board, issues WebSocket grants, forwards
+// steering, and (with CLAUDE_STANDBY set) DMs a HANDOFF prompt to a Claude Code session.
 import { resolve } from "node:path"
 import type { RelayAgentClient } from "@agent-relay/sdk"
 import { actors } from "../generated/index.js"
@@ -10,6 +11,8 @@ import { joinAs, joinChannel, relay, send } from "../shared/relay"
 const run = loadRun()
 const me = agentName(run.runId, "bridge")
 const human = agentName(run.runId, "human")
+// Relay name of a Claude Code session acting as a standby (see app/tools/README.md).
+const claudeStandby = process.env.CLAUDE_STANDBY ?? ""
 const bootedAt = Date.now()
 const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 23), "bridge", ...a)
 
@@ -24,10 +27,7 @@ function pushFeed(item: FeedItem) {
 
 const taskOf = (taskId: string) => actors.Task.get(actorId(run.runId, taskId))
 type State = Awaited<ReturnType<ReturnType<typeof taskOf>["getState"]>>
-const states = new Map<string, State>()
-const announcedDone = new Set<string>()
-const announcedLost = new Set<string>()
-const waitingNoted = new Set<string>()
+const announced = new Set<string>()
 
 let client: RelayAgentClient | null = null
 let humanClient: RelayAgentClient | null = null
@@ -38,77 +38,61 @@ async function announce(to: string, text: string, meta: RelayMeta, key: string) 
     pushFeed({ at: Date.now(), type: meta.type, from: me, to, text: sent === null ? `${text} (already sent)` : text })
 }
 
-function idleStandby(lostWorker: string | null): string | null {
-    const busy = new Set([...states.values()].filter(s => s.status === "running" || s.status === "handing-off").map(s => s.assignee))
-    const candidates = run.standbys.map(s => agentName(run.runId, s)).filter(s => !busy.has(s) && s !== lostWorker)
-    return candidates[0] ?? null
+// Announces each event once per bridge process; Relay idempotency keys make a restarted
+// bridge's repeat a no-op on the server.
+async function once(key: string, fn: () => Promise<void>) {
+    if (announced.has(key)) return
+    announced.add(key)
+    await fn().catch(e => {
+        announced.delete(key)
+        throw e
+    })
 }
 
-async function handOff(s: State) {
-    const key = `${s.taskId}:${s.attempt}`
-    if (!announcedLost.has(key)) {
-        const shortLost = (s.lostWorker ?? "?").replace(`${run.runId}-`, "")
-        const cid = correlationId(run.runId, s.taskId, s.attempt)
-        await announce(`#${run.channel}`, `LOST ${s.taskId}: ${shortLost} went silent; now attempt ${s.attempt}`, { v: 1, type: "LOST", runId: run.runId, taskId: s.taskId, attempt: s.attempt, from: me, correlationId: cid }, relayKey(run.runId, s.taskId, s.attempt, "lost"))
-        announcedLost.add(key)
-    }
-    const standby = idleStandby(s.lostWorker)
-    if (!standby) {
-        if (!waitingNoted.has(key)) {
-            waitingNoted.add(key)
-            pushFeed({ at: Date.now(), type: "WAIT", from: me, to: "-", text: `${s.taskId} attempt ${s.attempt}: waiting for a free standby` })
-        }
+async function observe(s: State) {
+    const cid = correlationId(run.runId, s.taskId, s.attempt)
+    // Safety net: an expired lease that the alarm did not handle (G1: a runtime crash drops alarms).
+    // Standbys run the same check, so this is not needed for progress.
+    if (s.status === "running" && s.leaseDeadline !== null && s.now > s.leaseDeadline + 2000) {
+        const r = await taskOf(s.taskId).expire({ attempt: s.attempt })
+        if (r.ok) log(`expired ${s.taskId} attempt ${s.attempt} (alarm missed)`)
         return
     }
-    const r = await taskOf(s.taskId).beginHandoff({ standby, attempt: s.attempt })
-    if (!r.ok) return
-    // Mark the standby busy now so a second lost task in the same poll picks a different one.
-    states.set(s.taskId, { ...s, status: "handing-off", assignee: standby })
-    await sendHandoff(s.taskId, s.attempt, standby, r.packet.ledger)
+    if (s.status === "lost") {
+        const lost = (s.lostWorker ?? "?").replace(`${run.runId}-`, "")
+        await once(`lost:${s.taskId}:${s.attempt}`, () =>
+            announce(`#${run.channel}`, `LOST ${s.taskId}: ${lost} went silent; the actor offered attempt ${s.attempt} to standbys`, { v: 1, type: "LOST", runId: run.runId, taskId: s.taskId, attempt: s.attempt, from: me, correlationId: cid }, relayKey(run.runId, s.taskId, s.attempt, "lost")),
+        )
+        if (claudeStandby && env.transport === "relay") {
+            await once(`handoff:${s.taskId}:${s.attempt}`, () => announce(`@${claudeStandby}`, handoffPrompt(s), { v: 1, type: "HANDOFF", runId: run.runId, taskId: s.taskId, attempt: s.attempt, from: me, correlationId: cid }, relayKey(run.runId, s.taskId, s.attempt, "handoff")))
+        }
+    } else if (s.status === "done") {
+        const by = (s.assignee ?? "?").replace(`${run.runId}-`, "")
+        await once(`done:${s.taskId}`, () =>
+            announce(`#${run.channel}`, `DONE ${s.taskId} by ${by} (${s.ledgerLength}/${s.totalSteps})`, { v: 1, type: "DONE", runId: run.runId, taskId: s.taskId, attempt: s.attempt, from: me, correlationId: cid }, relayKey(run.runId, s.taskId, s.attempt, "done")),
+        )
+    }
 }
 
-async function sendHandoff(taskId: string, attempt: number, standby: string, ledger: { stepId: number; summary: string }[]) {
-    const done = ledger.map(c => `${c.stepId}) ${c.summary.slice(0, 80)}`).join(" ")
-    const text = `HANDOFF ${taskId} attempt ${attempt}: continue from step ${ledger.length + 1}. Done so far: ${done || "nothing"}`
-    const meta: RelayMeta = { v: 1, type: "HANDOFF", runId: run.runId, taskId, attempt, from: me, correlationId: correlationId(run.runId, taskId, attempt) }
-    if (env.transport === "relay") await announce(`@${standby}`, text, meta, relayKey(run.runId, taskId, attempt, "handoff"))
-    else pushFeed({ at: Date.now(), type: "HANDOFF", from: me, to: standby, text: `${text} (poll transport)` })
-    await taskOf(taskId).markHandoffSent({ attempt })
+// A self-contained instruction for a Claude Code session that receives this DM as a turn.
+function handoffPrompt(s: State) {
+    const tool = `bun run ${resolve(import.meta.dir, "../tools/afterlife.ts")}`
+    const lost = (s.lostWorker ?? "?").replace(`${run.runId}-`, "")
+    return [
+        `HANDOFF ${s.taskId} attempt ${s.attempt}: agent ${lost} died at step ${s.ledgerLength + 1} of ${s.totalSteps}${s.cutOff ? " in the middle of a sentence" : ""}. Please take over this Afterlife task.`,
+        `1. Claim it: ${tool} claim ${s.taskId} ${s.attempt} --as cc  (prints the fact sheet, the saved steps and any cut-off sentence; if it prints STOP, another agent won).`,
+        `2. For each remaining step, write a 70-110 word section that continues the earlier ones (finish the cut-off sentence first, without repeating it), then save it: ${tool} checkpoint ${s.taskId} ${s.attempt} --as cc --step N --summary "<one sentence>" --text "<section>"`,
+        `3. Finish: ${tool} complete ${s.taskId} ${s.attempt} --as cc. If any command prints STOP, stop at once.`,
+    ].join("\n")
 }
 
 async function tick() {
     for (const t of run.tasks) {
         try {
-            states.set(t.id, await taskOf(t.id).getState())
+            await observe(await taskOf(t.id).getState())
         } catch (e: any) {
-            log(`reading ${t.id} failed: ${e?.message}`)
+            log(`observing ${t.id} failed: ${e?.message}`)
         }
-    }
-    for (const s of [...states.values()]) {
-        try {
-            await supervise(s)
-        } catch (e: any) {
-            log(`supervising ${s.taskId} failed: ${e?.message}`)
-        }
-    }
-}
-
-async function supervise(s: State) {
-    const leased = s.status === "running" || s.status === "handing-off"
-    // Safety net: an expired lease that the alarm did not handle (G1: a runtime crash drops alarms).
-    if (leased && s.leaseDeadline !== null && s.now > s.leaseDeadline + 2000) {
-        const r = await taskOf(s.taskId).expire({ attempt: s.attempt })
-        if (r.ok) log(`expired ${s.taskId} attempt ${s.attempt} (alarm missed)`)
-        return
-    }
-    if (s.status === "lost") await handOff(s)
-    else if (s.status === "handing-off" && s.handoff && !s.handoff.dmSent) {
-        const packet = await taskOf(s.taskId).beginHandoff({ standby: s.handoff.to, attempt: s.handoff.attempt })
-        if (packet.ok) await sendHandoff(s.taskId, s.handoff.attempt, s.handoff.to, packet.packet.ledger)
-    } else if (s.status === "done" && !announcedDone.has(s.taskId)) {
-        const by = (s.assignee ?? "?").replace(`${run.runId}-`, "")
-        await announce(`#${run.channel}`, `DONE ${s.taskId} by ${by} (${s.ledgerLength}/${s.totalSteps})`, { v: 1, type: "DONE", runId: run.runId, taskId: s.taskId, attempt: s.attempt, from: me, correlationId: correlationId(run.runId, s.taskId, s.attempt) }, relayKey(run.runId, s.taskId, s.attempt, "done"))
-        announcedDone.add(s.taskId)
     }
 }
 
@@ -139,7 +123,7 @@ async function main() {
         const r = await taskOf(t.id).rearm()
         if (r.ok) log(`re-armed ${t.id} lease`)
     }
-    log(`up: run ${run.runId}, transport ${env.transport}, board http://127.0.0.1:${env.bridgePort}`)
+    log(`up: run ${run.runId}, transport ${env.transport}, board http://127.0.0.1:${env.bridgePort}${claudeStandby ? `, Claude standby @${claudeStandby}` : ""}`)
     ;(async () => {
         for (;;) {
             await tick().catch(e => log("poll error", e?.message))
@@ -161,10 +145,10 @@ Bun.serve({
         if (host !== `127.0.0.1:${env.bridgePort}` && host !== `localhost:${env.bridgePort}`) return new Response("forbidden", { status: 403 })
         if (url.pathname === "/") return new Response(Bun.file(boardFile), { headers: { "Content-Type": "text/html; charset=utf-8" } })
         if (url.pathname === "/api/run") {
-            return Response.json({ runId: run.runId, channel: run.channel, tasks: run.tasks, transport: env.transport, llmMode: env.llmMode, model: env.openaiModel, stepPaceMs: env.stepPaceMs, bridgeBootedAt: bootedAt, steer: process.env.STEER_ENABLED === "1" })
+            return Response.json({ runId: run.runId, channel: run.channel, tasks: run.tasks, transport: env.transport, llmMode: env.llmMode, model: env.openaiModel, stepPaceMs: env.stepPaceMs, bridgeBootedAt: bootedAt, steer: process.env.STEER_ENABLED === "1", claudeStandby: claudeStandby || null })
         }
         if (url.pathname === "/api/grants") {
-            const grants = await Promise.all(run.tasks.map(async t => ({ taskId: t.id, ...(await actors.Task.prepareWebsocket({ actorId: actorId(run.runId, t.id), metadata: { viewer: "board" } })) })))
+            const grants = await Promise.all(run.tasks.map(async t => ({ taskId: t.id, ...(await actors.Task.prepareWebsocket({ actorId: actorId(run.runId, t.id), metadata: { viewer: "board", role: "board" } })) })))
             return Response.json(grants, { headers: { "Cache-Control": "no-store" } })
         }
         if (url.pathname === "/api/feed") {

@@ -1,6 +1,6 @@
 // A worker agent process. Usage:
-//   bun run worker/index.ts worker w1 t1    (owns task t1 from attempt 1)
-//   bun run worker/index.ts standby s1      (waits for a HANDOFF DM, then continues that task)
+//   bun run worker/index.ts worker w1 t1    (owns task t1 from attempt 1, exits when done)
+//   bun run worker/index.ts standby s1      (waits for a Task actor to offer a lost task, then continues it)
 import type { RelayAgentClient } from "@agent-relay/sdk"
 import { actors } from "../generated/index.js"
 import { actorId, agentName, correlationId, env, loadRun, relayKey, sleep, type RelayMeta } from "../shared/config"
@@ -20,13 +20,19 @@ const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 
 
 type Directive = { id: string; text: string; from: string; at: number }
 type Ledger = { stepId: number; summary: string; worker: string }[]
+type Draft = { stepId: number; worker: string; text: string } | null
 type Current = { taskId: string; attempt: number; directives: Directive[] }
+type ClaimInfo = { attempt: number; ledger: Ledger; directives: Directive[]; cutOff: Draft; nextStep: number }
 
 let current: Current | null = null
+// Set synchronously before the first await of a claim, so an actor offer, a poll and a
+// retry arriving together can never start the same (or a second) task in this process.
+let busy: symbol | null = null
 const handled = new Set<string>()
 let client: RelayAgentClient | null = null
 
 const FENCED = new Set(["stale-attempt", "wrong-owner"])
+const DRAFT_EVERY_MS = 350
 
 // Actor calls: 3 s timeout per attempt, retries at 0.5 s, 1 s, 2 s, then throw.
 // A worker only gives up once the actor has been unreachable for longer than a lease,
@@ -66,11 +72,36 @@ function fenced(taskId: string, reason: string) {
     process.exit(0)
 }
 
-async function runTask(taskId: string, attempt: number, ledger: Ledger, directives: Directive[], nextStep: number) {
+// Streams the text being written into the actor, at most every DRAFT_EVERY_MS, so the board
+// shows it live and a successor can finish the sentence if this process dies.
+function draftStreamer(taskId: string, attempt: number, stepId: number) {
+    const task = actors.Task.get(actorId(run.runId, taskId))
+    let latest = ""
+    let sent = ""
+    let inFlight = false
+    const timer = setInterval(async () => {
+        if (inFlight || latest === sent) return
+        inFlight = true
+        const text = latest
+        try {
+            const r = await call(() => task.writeDraft({ worker: me, attempt, stepId, text }))
+            if (!r.ok && FENCED.has(r.reason)) fenced(taskId, r.reason)
+            sent = text
+        } catch {
+            // The heartbeat decides whether the actor is really gone.
+        } finally {
+            inFlight = false
+        }
+    }, DRAFT_EVERY_MS)
+    return { push: (text: string) => void (latest = text), stop: () => clearInterval(timer) }
+}
+
+async function runTask(taskId: string, info: ClaimInfo) {
+    const { attempt } = info
     const task = actors.Task.get(actorId(run.runId, taskId))
     const sheet = FACT_SHEETS.find(s => s.id === taskId)!
-    current = { taskId, attempt, directives: [...directives] }
-    log(`running ${taskId} attempt ${attempt} from step ${nextStep}`)
+    current = { taskId, attempt, directives: [...info.directives] }
+    log(`running ${taskId} attempt ${attempt} from step ${info.nextStep}${info.cutOff ? ` (finishing ${info.cutOff.worker}'s cut-off step ${info.cutOff.stepId})` : ""}`)
 
     // The heartbeat has its own timer so a slow LLM call does not expire the lease.
     const beat = setInterval(async () => {
@@ -78,15 +109,22 @@ async function runTask(taskId: string, attempt: number, ledger: Ledger, directiv
             const r = await call(() => task.heartbeat({ worker: me, attempt }))
             if (!r.ok && FENCED.has(r.reason)) fenced(taskId, r.reason)
         } catch {
-            // Retries exhausted; the lease will lapse and the bridge hands the task off.
+            // Retries exhausted; the lease will lapse and the actor offers the task to a standby.
         }
     }, env.heartbeatMs)
 
     try {
-        const previous = [...ledger]
-        for (let stepId = nextStep; stepId <= env.totalSteps; stepId++) {
+        const previous = [...info.ledger]
+        for (let stepId = info.nextStep; stepId <= env.totalSteps; stepId++) {
             const started = Date.now()
-            const out = await writeStep({ sheet, stepId, previous, directives: current.directives, worker: me })
+            const cutOff = info.cutOff && info.cutOff.stepId === stepId ? info.cutOff : null
+            const draft = draftStreamer(taskId, attempt, stepId)
+            let out
+            try {
+                out = await writeStep({ sheet, stepId, previous, directives: current.directives, worker: me, cutOff }, draft.push)
+            } finally {
+                draft.stop()
+            }
             const wait = env.stepPaceMs - (Date.now() - started)
             if (wait > 0) await sleep(wait)
             const r = await callOrExit(() => task.checkpoint({ worker: me, attempt, step: { stepId, ...out } }))
@@ -97,10 +135,10 @@ async function runTask(taskId: string, attempt: number, ledger: Ledger, directiv
             }
             const stored = r.stored
             previous.push({ stepId, summary: stored.summary, worker: stored.worker })
-            log(`step ${stepId}/${env.totalSteps}${r.duplicate ? " (already stored)" : ""}`)
+            log(`step ${stepId}/${env.totalSteps}${r.duplicate ? " (already stored)" : ""}${cutOff ? " (finished the cut-off sentence)" : ""}`)
             if (env.transport === "relay" && client) {
                 const meta: RelayMeta = { v: 1, type: "CKPT", runId: run.runId, taskId, attempt, stepId, from: me, correlationId: correlationId(run.runId, taskId, attempt) }
-                await send(client, `#${run.channel}`, `CKPT ${taskId} step ${stepId}/${env.totalSteps} by ${short}: ${stored.summary}`, meta, relayKey(run.runId, taskId, attempt, `ckpt:${stepId}`)).catch(e =>
+                await send(client, `#${run.channel}`, `CKPT ${taskId} step ${stepId}/${env.totalSteps} by ${short} (attempt ${attempt}): ${stored.summary}`, meta, relayKey(run.runId, taskId, attempt, `ckpt:${stepId}`)).catch(e =>
                     log("CKPT send failed", e?.message),
                 )
             }
@@ -114,17 +152,42 @@ async function runTask(taskId: string, attempt: number, ledger: Ledger, directiv
     }
 }
 
-async function claimAndRun(taskId: string, attempt: number) {
+async function claimAndRun(taskId: string, attempt: number, via: string) {
     const key = `${taskId}:${attempt}`
-    if (handled.has(key) || current) return
-    const task = actors.Task.get(actorId(run.runId, taskId))
-    const r = await callOrExit(() => task.claim({ worker: me, attempt }))
+    if (busy || handled.has(key)) return
+    const token = Symbol(key)
+    busy = token
     handled.add(key)
-    if (!r.ok) {
-        log(`claim ${taskId} attempt ${attempt} refused: ${r.reason}`)
-        return
+    try {
+        const task = actors.Task.get(actorId(run.runId, taskId))
+        const r = await callOrExit(() => task.claim({ worker: me, attempt }))
+        if (!r.ok) {
+            log(`claim ${taskId} attempt ${attempt} (${via}) refused: ${r.reason}`)
+            return
+        }
+        if (attempt > 1 && !r.already) await announceTakeover(taskId, attempt, via)
+        await runTask(taskId, r)
+    } finally {
+        if (busy === token) busy = null
     }
-    await runTask(taskId, attempt, r.ledger, r.directives, r.nextStep)
+}
+
+// Agent to agent over Relay: tell the fleet who took the task, and tell the agent it replaced.
+// The actor already enforces ownership; these messages explain it to the agents and humans.
+async function announceTakeover(taskId: string, attempt: number, via: string) {
+    const s = await call(() => actors.Task.get(actorId(run.runId, taskId)).getState()).catch(() => null)
+    const t = s?.takeover
+    const from = t?.from ?? null
+    const fromShort = (from ?? "?").replace(`${run.runId}-`, "")
+    const cut = s?.cutOff ? `, finishing its cut-off sentence "…${s.cutOff.text.slice(-40)}"` : ""
+    const after = t?.afterMs != null ? ` ${(t.afterMs / 1000).toFixed(1)}s after it was lost` : ""
+    log(`took ${taskId} attempt ${attempt} from ${fromShort} via ${via}`)
+    if (env.transport !== "relay" || !client) return
+    const cid = correlationId(run.runId, taskId, attempt)
+    await send(client, `#${run.channel}`, `TOOK ${taskId} attempt ${attempt} from ${fromShort} at step ${t?.atStep ?? "?"}${after}${cut}`, { v: 1, type: "TOOK", runId: run.runId, taskId, attempt, from: me, correlationId: cid }, relayKey(run.runId, taskId, attempt, "took")).catch(e => log("TOOK send failed", e?.message))
+    if (from) {
+        await send(client, `@${from}`, `TOMBSTONE ${taskId}: attempt ${attempt} belongs to ${short} now. Stop writing; the actor will reject attempt ${attempt - 1}.`, { v: 1, type: "TOMBSTONE", runId: run.runId, taskId, attempt, from: me, correlationId: cid }, relayKey(run.runId, taskId, attempt, "tombstone")).catch(e => log("TOMBSTONE send failed", e?.message))
+    }
 }
 
 async function onSteer(meta: RelayMeta & Record<string, unknown>, text: string) {
@@ -140,6 +203,30 @@ async function onSteer(meta: RelayMeta & Record<string, unknown>, text: string) 
     log(`steer ${directive.id}: ${r.ok ? "recorded" : r.reason}`)
 }
 
+// One WebSocket per Task actor, tagged "standby". The actor pushes an `offer` when its lease
+// expires, and its initial `state` shows a task that was lost before we connected.
+function watchOffers(taskId: string, delay = 1000) {
+    const retry = () => setTimeout(() => watchOffers(taskId, Math.min(delay * 2, 5000)), delay)
+    actors.Task.prepareWebsocket({ actorId: actorId(run.runId, taskId), metadata: { viewer: me, role: "standby", name: me } })
+        .then(({ websocketUrl }) => {
+            const ws = new WebSocket(websocketUrl)
+            ws.onopen = () => {
+                delay = 1000
+            }
+            ws.onmessage = ev => {
+                const m = JSON.parse(String(ev.data))
+                if (m.type === "offer" && m.lostWorker !== me) {
+                    log(`offer from actor ${taskId}: attempt ${m.attempt}, lost by ${String(m.lostWorker).replace(`${run.runId}-`, "")}`)
+                    claimAndRun(m.taskId, m.attempt, "actor offer").catch(e => log("takeover failed", e?.message))
+                } else if (m.type === "state" && m.state?.status === "lost" && m.state.lostWorker !== me) {
+                    claimAndRun(taskId, m.state.attempt, "actor state").catch(e => log("takeover failed", e?.message))
+                }
+            }
+            ws.onclose = retry
+        })
+        .catch(retry)
+}
+
 async function main() {
     log(`starting as ${role} (transport ${env.transport}, llm ${env.llmMode})`)
     if (env.transport === "relay") {
@@ -148,58 +235,47 @@ async function main() {
             client = await joinAs(r, me)
             await joinChannel(client, run.channel)
             r.addListener("dm.received", async (event: any) => {
-            const message = event.message
-            const meta = (await readMeta(client!, message.id)) ?? (message.from?.name === agentName(run.runId, "bridge") ? parseText(message.text) : null)
-            if (!meta) {
-                log(`DM ${message.id} without readable metadata, ignored`)
-                return
-            }
-            if (meta.runId !== run.runId) return
-            if (meta.type === "HANDOFF" && role === "standby") {
-                log(`HANDOFF received for ${meta.taskId} attempt ${meta.attempt}`)
-                claimAndRun(meta.taskId, meta.attempt).catch(e => log("handoff run failed", e?.message))
-            } else if (meta.type === "STEER") {
-                onSteer(meta, message.text).catch(e => log("steer failed", e?.message))
-            }
+                const message = event.message
+                const meta = await readMeta(client!, message.id)
+                if (!meta || meta.runId !== run.runId) return
+                if (meta.type === "STEER") onSteer(meta, message.text).catch(e => log("steer failed", e?.message))
+                else if (meta.type === "TOMBSTONE") log(`TOMBSTONE from ${String(meta.from).replace(`${run.runId}-`, "")}: ${message.text}`)
             })
         } catch (e: any) {
             client = null
-            log(`Relay unavailable (${e?.message}); continuing without checkpoints on #fleet`)
+            log(`Relay unavailable (${e?.message}); continuing without #fleet messages`)
         }
     }
 
     if (role === "worker") {
-        await claimAndRun(firstTask!, 1)
-        // Stay available as a standby after finishing the first task.
+        await claimAndRun(firstTask!, 1, "start")
+        process.exit(0)
     }
 
-    // Polling for tasks offered to this agent: the only path with TRANSPORT=poll (Afterlife-solo),
-    // and a slower backstop for a missed HANDOFF DM with Relay.
+    for (const t of run.tasks) watchOffers(t.id)
+
+    // Backstop for a missed offer: find lost tasks by polling, and expire a lease whose alarm
+    // was dropped (a crash of the actor runtime loses pending alarms). With TRANSPORT=poll
+    // this is the only path, on a faster period.
     const period = env.transport === "poll" ? env.pollMs : 3000
     for (;;) {
-        if (!current) {
-            for (const t of run.tasks) {
-                try {
-                    const s = await call(() => actors.Task.get(actorId(run.runId, t.id)).getState())
-                    if (s.status === "handing-off" && s.assignee === me) {
-                        if (env.transport === "relay") log(`found ${t.id} offered to me by polling (no DM yet)`)
-                        await claimAndRun(t.id, s.attempt)
-                    }
-                } catch {
-                    // Actor briefly unreachable; try again next round.
+        await sleep(period)
+        if (busy) continue
+        for (const t of run.tasks) {
+            try {
+                const task = actors.Task.get(actorId(run.runId, t.id))
+                const s = await call(() => task.getState())
+                if (s.status === "running" && s.leaseDeadline !== null && s.now > s.leaseDeadline + 2000) {
+                    const r = await call(() => task.expire({ attempt: s.attempt }))
+                    if (r.ok) log(`expired ${t.id} attempt ${s.attempt} (alarm missed)`)
+                } else if (s.status === "lost" && s.lostWorker !== me) {
+                    await claimAndRun(t.id, s.attempt, "poll")
                 }
+            } catch {
+                // Actor briefly unreachable; try again next round.
             }
         }
-        await sleep(period)
     }
-}
-
-// Fallback when metadata cannot be read back: the bridge's HANDOFF text carries task and attempt.
-function parseText(text: string): (RelayMeta & Record<string, unknown>) | null {
-    const m = /^HANDOFF (\S+) attempt (\d+):/.exec(text ?? "")
-    if (!m) return null
-    const attempt = Number(m[2])
-    return { v: 1, type: "HANDOFF", runId: run.runId, taskId: m[1]!, attempt, from: "text", correlationId: correlationId(run.runId, m[1]!, attempt) }
 }
 
 main().catch(e => {

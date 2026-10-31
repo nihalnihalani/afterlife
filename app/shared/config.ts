@@ -50,7 +50,7 @@ export const relayKey = (runId: string, taskId: string, attempt: number, kind: s
 
 export type RelayMeta = {
     v: 1
-    type: "CKPT" | "LOST" | "HANDOFF" | "DONE" | "STEER"
+    type: "CKPT" | "LOST" | "HANDOFF" | "DONE" | "STEER" | "TOOK" | "TOMBSTONE"
     runId: string
     taskId: string
     attempt: number

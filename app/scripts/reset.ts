@@ -17,6 +17,6 @@ const config: RunConfig = {
 }
 writeFileSync(`${RUN_DIR}/run.json`, JSON.stringify(config, null, 2))
 for (const t of config.tasks) {
-    await actors.Task.get(actorId(runId, t.id)).init({ taskId: t.id, title: t.title, totalSteps: env.totalSteps, leaseMs: env.leaseMs, handoffTimeoutMs: env.handoffTimeoutMs, maxAttempts: env.maxAttempts })
+    await actors.Task.get(actorId(runId, t.id)).init({ taskId: t.id, title: t.title, totalSteps: env.totalSteps, leaseMs: env.leaseMs, maxAttempts: env.maxAttempts })
 }
 console.log(`run ${runId} ready: ${config.tasks.map(t => t.id).join(", ")}`)
