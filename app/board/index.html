@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Afterlife</title>
+<style>
+  :root {
+    --bg: #0d0b12; --panel: #17141f; --line: #2a2536; --text: #e9e4f2; --muted: #9a91ab;
+    --run: #7ee0a1; --lost: #ff5d6c; --hand: #ffb547; --done: #6fb8ff; --fail: #b8324a; --queue: #7c7390;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: baseline; padding: 14px 18px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0; font-size: 20px; letter-spacing: .08em; }
+  h1 small { font-size: 12px; color: var(--muted); letter-spacing: 0; font-weight: 400; margin-left: 8px; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); }
+  .badge.warn { color: #fff; background: var(--fail); border-color: var(--fail); }
+  .badge.ok::before { content: "● "; color: var(--run); }
+  .badge.bad::before { content: "● "; color: var(--lost); }
+  main { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; padding: 14px 18px; }
+  .card .content { display: flex; flex-direction: column; gap: 8px; flex: 1; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; min-height: 320px; display: flex; flex-direction: column; gap: 8px; transition: border-color .3s, box-shadow .3s; }
+  .card.lost { border-color: var(--lost); box-shadow: 0 0 22px #ff5d6c40; }
+  .card.handing-off { border-color: var(--hand); }
+  .card.done { border-color: var(--done); }
+  .card.failed { border-color: var(--fail); }
+  .top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .title { font-weight: 600; }
+  .status { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px; color: #120f18; background: var(--queue); text-transform: uppercase; }
+  .status.running { background: var(--run); } .status.lost { background: var(--lost); } .status.handing-off { background: var(--hand); }
+  .status.done { background: var(--done); } .status.failed { background: var(--fail); color: #fff; }
+  .meta { color: var(--muted); font-size: 12px; }
+  .lease { height: 8px; background: #241f2e; border-radius: 4px; overflow: hidden; }
+  .lease > div { height: 100%; background: var(--run); transition: width .25s linear, background .25s; }
+  .ledger { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; overflow: auto; max-height: 360px; }
+  .ledger li { border-left: 3px solid var(--line); padding: 2px 0 2px 8px; }
+  .ledger li.handed { border-left-color: var(--hand); }
+  .ledger .who { font-size: 11px; color: var(--muted); }
+  .ledger .chips span { font-size: 10px; border: 1px solid var(--hand); color: var(--hand); border-radius: 99px; padding: 0 6px; margin-right: 4px; }
+  .ledger .pending { color: var(--muted); font-style: italic; }
+  .rejections { font-size: 12px; color: #fff; background: #5a1622; border: 1px solid var(--lost); border-radius: 6px; padding: 4px 8px; }
+  .directives { font-size: 12px; color: var(--hand); }
+  .timeline { font-size: 11px; color: var(--muted); white-space: pre-line; border-top: 1px dashed var(--line); padding-top: 6px; margin-top: auto; }
+  .steer { display: flex; gap: 6px; }
+  .steer input { flex: 1; background: #0f0d14; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  .steer button { background: var(--hand); color: #120f18; border: 0; border-radius: 6px; padding: 5px 10px; font-weight: 600; cursor: pointer; }
+  section.feed { margin: 0 18px 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  section.feed h2 { font-size: 12px; letter-spacing: .08em; color: var(--muted); margin: 0 0 6px; }
+  #feed { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column-reverse; gap: 3px; max-height: 220px; overflow: auto; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .chip { display: inline-block; min-width: 70px; font-weight: 700; }
+  .chip.CKPT { color: var(--run); } .chip.LOST { color: var(--lost); } .chip.HANDOFF { color: var(--hand); } .chip.DONE { color: var(--done); } .chip.STEER { color: #d58cff; }
+  .empty { padding: 40px 18px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>AFTERLIFE <small>when an agent dies, its work doesn't</small></h1>
+  <span class="badge" id="run">run …</span>
+  <span class="badge" id="transport">transport …</span>
+  <span class="badge" id="llm">LLM …</span>
+  <span class="badge warn">DATA: SYNTHETIC</span>
+  <span class="badge" id="pace"></span>
+  <span class="badge" id="ws">actors ws</span>
+  <span class="badge" id="sse">bridge feed</span>
+</header>
+<main id="cards"><div class="empty">Loading run…</div></main>
+<section class="feed"><h2>AGENT RELAY · #fleet + DMs</h2><ul id="feed"></ul></section>
+<script>
+  const SECTIONS = ["Arrival", "Ground floor", "Upper floors", "The anomaly", "Witness accounts", "Conclusion"]
+  const state = {}
+  const steerForms = {}
+  const downWindows = [] // [start, end] periods when the bridge feed was offline
+  let run = null
+  const $ = id => document.getElementById(id)
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e }
+  const short = name => (name || "").replace(run.runId + "-", "")
+  const setBadge = (id, text, cls) => { const b = $(id); b.textContent = text; b.className = "badge " + (cls || "") }
+  const whileBridgeDown = at => downWindows.some(([a, b]) => at >= a && at <= (b ?? Infinity))
+
+  async function boot() {
+    try { const res = await fetch("/api/run"); if (!res.ok) throw new Error(); run = await res.json() } catch { $("cards").replaceChildren(el("div", "empty", "Bridge offline. Start the bridge; this page retries.")); return setTimeout(boot, 2000) }
+    setBadge("run", "run " + run.runId)
+    setBadge("transport", "transport: " + run.transport.toUpperCase(), run.transport === "poll" ? "warn" : "")
+    setBadge("llm", "LLM: " + (run.llmMode === "openai" ? "OPENAI " + run.model : "CANNED"), run.llmMode === "openai" ? "" : "warn")
+    setBadge("pace", run.stepPaceMs ? "pace " + (run.stepPaceMs / 1000) + "s/step" : "")
+    $("cards").replaceChildren()
+    for (const t of run.tasks) state[t.id] = { taskId: t.id, title: t.title, status: "queued", ledger: [], rejections: [], timeline: [], directives: [] }
+    render()
+    connectActors()
+    connectFeed()
+  }
+
+  // One WebSocket per Task actor. Any close (or failed handshake) triggers exactly one
+  // reconnect of the whole group with a fresh grant, backing off 1 s -> 5 s.
+  async function connectActors(delay = 1000) {
+    let retried = false
+    const sockets = []
+    const retry = () => {
+      if (retried) return
+      retried = true
+      for (const s of sockets) { s.onclose = null; s.close() }
+      setBadge("ws", "actors ws: reconnecting (showing last known state)", "bad")
+      setTimeout(() => connectActors(Math.min(delay * 2, 5000)), delay)
+    }
+    try {
+      const res = await fetch("/api/grants")
+      const grants = await res.json()
+      if (!res.ok || !Array.isArray(grants)) throw new Error("bad grants")
+      let open = 0
+      for (const g of grants) {
+        const ws = new WebSocket(g.websocketUrl)
+        sockets.push(ws)
+        ws.onopen = () => { if (++open === grants.length) { setBadge("ws", "actors ws", "ok"); delay = 1000 } }
+        ws.onmessage = ev => {
+          const msg = JSON.parse(ev.data)
+          if (msg.type === "state") Object.assign(state[g.taskId], msg.state)
+          else if (msg.type === "state_update") Object.assign(state[g.taskId], msg.changes)
+          scheduleRender()
+        }
+        ws.onclose = retry
+      }
+    } catch { retry() }
+  }
+
+  function connectFeed() {
+    const es = new EventSource("/api/feed")
+    es.onopen = () => {
+      const last = downWindows[downWindows.length - 1]
+      if (last && last[1] == null) last[1] = Date.now()
+      setBadge("sse", "bridge feed", "ok")
+    }
+    es.onerror = () => {
+      const last = downWindows[downWindows.length - 1]
+      if (!last || last[1] != null) downWindows.push([Date.now(), null])
+      setBadge("sse", "bridge offline (cards still live via actors)", "bad")
+    }
+    es.onmessage = ev => {
+      const item = JSON.parse(ev.data)
+      const li = el("li")
+      li.append(el("span", "chip " + item.type, item.type), document.createTextNode(" " + new Date(item.at).toLocaleTimeString() + "  " + short(item.from) + " → " + short(item.to).replace("#" + run.channel, "#fleet") + "  " + item.text))
+      $("feed").prepend(li)
+    }
+  }
+
+  function rejectionText(r) {
+    if (r.reason === "stale-attempt") return "✕ " + r.op + " from " + short(r.worker) + " rejected: stale attempt " + r.seenAttempt + " (current " + r.currentAttempt + ")"
+    if (r.reason === "wrong-owner") return "✕ " + r.op + " from " + short(r.worker) + " rejected: not the owner of attempt " + r.currentAttempt
+    return "✕ " + r.op + " from " + short(r.worker) + " rejected: " + r.reason + " (attempt " + r.seenAttempt + ", current " + r.currentAttempt + ")"
+  }
+
+  function steerFormFor(taskId) {
+    if (steerForms[taskId]) return steerForms[taskId]
+    const f = el("form", "steer"), input = el("input")
+    input.maxLength = 200
+    f.append(input, el("button", "", "Steer"))
+    f.onsubmit = async ev => {
+      ev.preventDefault()
+      const text = input.value.trim()
+      if (!text) return
+      input.value = ""
+      await fetch("/api/steer", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ taskId, text }) })
+    }
+    return (steerForms[taskId] = f)
+  }
+
+  let pending = false
+  function scheduleRender() {
+    if (pending) return
+    pending = true
+    requestAnimationFrame(() => { pending = false; render() })
+  }
+
+  function render() {
+    const now = Date.now()
+    for (const t of run.tasks) {
+      const s = state[t.id]
+      let card = document.getElementById("card-" + t.id)
+      if (!card) {
+        card = el("div", "card"); card.id = "card-" + t.id
+        card.append(el("div", "content"))
+        $("cards").append(card)
+      }
+      card.className = "card " + s.status
+      const content = card.firstChild
+      const oldLedger = content.querySelector(".ledger")
+      const scroll = oldLedger ? oldLedger.scrollTop : 0
+      content.replaceChildren()
+      const top = el("div", "top")
+      top.append(el("span", "title", t.id + " · " + (s.title || t.title)), el("span", "status " + s.status, s.status))
+      content.append(top)
+      const owner = s.status === "lost" ? "was " + short(s.lostWorker) : s.status === "handing-off" ? "offered to " + short(s.assignee) : short(s.assignee) || "—"
+      content.append(el("div", "meta", "owner " + owner + " · attempt " + (s.attempt || 0) + " · " + (s.ledger || []).length + "/" + (s.totalSteps || 6) + " steps"))
+      const lease = el("div", "lease"), fill = el("div")
+      const left = s.leaseDeadline ? Math.max(0, s.leaseDeadline - now) : 0
+      const pct = s.status === "running" || s.status === "handing-off" ? Math.min(100, (left / (s.leaseMs || 10000)) * 100) : s.status === "done" ? 100 : 0
+      fill.style.width = pct + "%"
+      fill.style.background = s.status === "done" ? "var(--done)" : pct < 35 ? "var(--lost)" : pct < 65 ? "var(--hand)" : "var(--run)"
+      lease.append(fill); content.append(lease)
+      let leaseText = ""
+      if (s.status === "running" || s.status === "handing-off") leaseText = "lease " + (left / 1000).toFixed(1) + "s"
+      if (s.lostAt) leaseText += (leaseText ? " · " : "") + "last lease expired " + new Date(s.lostAt).toLocaleTimeString() + (whileBridgeDown(s.lostAt) ? " while the bridge was down" : "")
+      content.append(el("div", "meta", leaseText))
+      const ul = el("ol", "ledger")
+      let prevWorker = null
+      for (const c of s.ledger || []) {
+        const li = el("li", prevWorker && c.worker !== prevWorker ? "handed" : "")
+        li.append(el("div", "who", c.stepId + " · " + SECTIONS[c.stepId - 1] + " · " + short(c.worker) + " (attempt " + c.attempt + ")"), el("div", "", c.text))
+        if (c.callbacks && c.callbacks.length && prevWorker && c.worker !== prevWorker) {
+          const chips = el("div", "chips"); for (const cb of c.callbacks) chips.append(el("span", "", cb)); li.append(chips)
+        }
+        prevWorker = c.worker
+        ul.append(li)
+      }
+      const n = (s.ledger || []).length
+      if (n < (s.totalSteps || 6) && s.status !== "failed") {
+        const li = el("li")
+        li.append(el("div", "pending", (n + 1) + " · " + SECTIONS[n] + (s.status === "running" ? " · writing…" : s.status === "queued" ? " · waiting for a worker" : " · waiting for handoff")))
+        ul.append(li)
+      }
+      content.append(ul)
+      ul.scrollTop = scroll
+      if ((s.directives || []).length) content.append(el("div", "directives", "directives: " + s.directives.map(d => "“" + d.text + "”").join(", ")))
+      for (const r of (s.rejections || []).slice(-3)) content.append(el("div", "rejections", rejectionText(r)))
+      const tl = (s.timeline || []).slice(-3)
+      if (tl.length) content.append(el("div", "timeline", tl.map(e => new Date(e.at).toLocaleTimeString() + " " + e.kind + ": " + e.detail.replaceAll(run.runId + "-", "")).join("\n")))
+      // The steer form lives outside the rebuilt content so typing survives live updates.
+      if (run.steer) {
+        const form = steerFormFor(t.id)
+        form.style.display = s.status === "running" ? "" : "none"
+        form.querySelector("input").placeholder = "steer " + short(s.assignee) + " (e.g. write it like a ghost)"
+        if (form.parentNode !== card) card.append(form)
+      }
+    }
+  }
+  setInterval(() => { if (run) scheduleRender() }, 250)
+  boot()
+</script>
+</body>
+</html>

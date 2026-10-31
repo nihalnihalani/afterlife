@@ -1,0 +1,21 @@
+{
+  "name": "app",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "typecheck": "bun check"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "durable-actors": "0.14.6"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "@agent-relay/sdk": "15.0.1",
+    "openai": "7.47.0",
+    "zod": "4.6.7"
+  }
+}

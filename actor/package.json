@@ -1,0 +1,22 @@
+{
+    "name": "afterlife-actor",
+    "private": true,
+    "type": "module",
+    "engines": {
+        "bun": ">=1.4.2"
+    },
+    "scripts": {
+        "dev": "durable-actors dev",
+        "check": "tsc --noEmit"
+    },
+    "dependencies": {
+        "durable-actors": "0.14.6"
+    },
+    "devDependencies": {
+        "@types/node": "^22.0.0",
+        "typescript": "~5.9.3"
+    },
+    "trustedDependencies": [
+        "esbuild"
+    ]
+}
